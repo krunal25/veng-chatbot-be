@@ -11,6 +11,7 @@ import { RagService } from "./services/rag.service";
 import { GuardrailService } from "./services/guardrail.service";
 import { QueryMonitorService } from "./services/monitor.service";
 import { GeminiService } from "./services/gemini.service";
+import "dotenv/config";
 
 @Module({
   imports: [
@@ -21,7 +22,7 @@ import { GeminiService } from "./services/gemini.service";
       // username: process.env.DB_USER || 'postgres',
       // password: process.env.DB_PASS || 'root',
       // database: process.env.DB_NAME || 'veng_chat',
-      url: "postgresql://neondb_owner:npg_iZJ4afh7Bsle@ep-odd-paper-aqjgt1wm.c-8.us-east-1.aws.neon.tech/neondb?sslmode=require",
+      url: process.env.DB_URL,
       ssl: { rejectUnauthorized: false },
       entities: [
         Conversation,
@@ -51,22 +52,3 @@ import { GeminiService } from "./services/gemini.service";
   ],
 })
 export class AppModule {}
-
-// Dev DB
-
-// @Module({
-//   imports: [
-//     TypeOrmModule.forRoot({
-//       type: 'postgres',
-//       url: 'postgresql://neondb_owner:npg_iZJ4afh7Bsle@ep-odd-paper-aqjgt1wm.c-8.us-east-1.aws.neon.tech/neondb?sslmode=require',
-//       ssl: { rejectUnauthorized: false },
-//       entities: [Conversation, Message, Part],
-//       synchronize: true,
-//       autoLoadEntities: true,
-//     }),
-//     TypeOrmModule.forFeature([Conversation, Message, Part]),
-//   ],
-//   controllers: [ApiController],
-//   providers: [ChatGateway, RagService, GuardrailService, QueryMonitorService],
-// })
-// export class AppModule {}
