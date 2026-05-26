@@ -2,18 +2,29 @@ import 'dotenv/config';
 import "reflect-metadata";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
+import { isOriginAllowed, parseAllowedOrigins } from './utils/request-safety.util';
 
 async function bootstrap() {
-  // const app = await NestFactory.create(AppModule);
+  const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
 
   const app = await NestFactory.create(AppModule, {
     cors: {
-      origin: true,
+      origin: (origin, callback) => {
+        if (isOriginAllowed(origin, allowedOrigins)) {
+          return callback(null, true);
+        }
+        return callback(new Error('CORS origin not allowed'), false);
+      },
       credentials: true,
     },
   });
   app.enableCors({
-    origin: "*",
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin, allowedOrigins)) {
+        return callback(null, true);
+      }
+      return callback(new Error('CORS origin not allowed'), false);
+    },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
   });
