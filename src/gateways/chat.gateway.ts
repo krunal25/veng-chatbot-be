@@ -1183,6 +1183,18 @@ import { RagService } from '../services/rag.service';
 import { GuardrailService } from '../services/guardrail.service';
 import { QueryMonitorService } from '../services/monitor.service';
 import { GeminiService } from '../services/gemini.service';
+import {
+  QueryUnderstandingService,
+  QueryWidgetContext,
+  StructuredQueryContext,
+} from '../services/query-understanding.service';
+import {
+  isUuidLike,
+  normalizeTextInput,
+  parseAllowedOrigins,
+} from '../utils/request-safety.util';
+
+const allowedGatewayOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
 
 type NlpReply = {
   content: string;
@@ -1191,8 +1203,17 @@ type NlpReply = {
   options?: string[];
 };
 
+type ChatMessagePayload = {
+  conversationId: string;
+  content: string;
+  queryContext?: QueryWidgetContext;
+};
+
 @WebSocketGateway({
-  cors: { origin: '*' },
+  cors: {
+    origin: allowedGatewayOrigins.length > 0 ? allowedGatewayOrigins : true,
+    credentials: true,
+  },
   namespace: '/',
 })
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -1200,9 +1221,34 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   server: Server;
 
   private static readonly ADMIN_WAIT_TIMEOUT_MS = 3 * 60 * 1000;
+  private static readonly MAX_CHAT_INPUT_LENGTH = 1000;
+  private static readonly MIN_RAG_SCORE_FOR_GEMINI_CONTEXT = 0.055;
   private adminSockets: Set<string> = new Set();
   private sessionToSocket: Map<string, string> = new Map();
   private socketToSession: Map<string, string> = new Map();
+
+  private sanitizeIncomingContent(input: unknown): string {
+    return normalizeTextInput(input, {
+      maxLength: ChatGateway.MAX_CHAT_INPUT_LENGTH,
+      collapseWhitespace: true,
+    });
+  }
+
+  private sanitizeQueryContext(input: unknown): QueryWidgetContext {
+    if (!input || typeof input !== 'object') return {};
+    const payload = input as Record<string, unknown>;
+    const toText = (value: unknown, max = 80) =>
+      normalizeTextInput(value, { maxLength: max, collapseWhitespace: true });
+
+    return {
+      brand: toText(payload.brand),
+      model: toText(payload.model),
+      variant: toText(payload.variant),
+      year: toText(payload.year, 8),
+      category: toText(payload.category),
+      part: toText(payload.part),
+    };
+  }
 
   constructor(
     @InjectRepository(Conversation)
@@ -1215,6 +1261,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private guardrailService: GuardrailService,
     private monitorService: QueryMonitorService,
     private geminiService: GeminiService,
+    private queryUnderstandingService: QueryUnderstandingService,
   ) {}
 
   handleConnection(client: Socket) {
@@ -1244,7 +1291,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { sessionId?: string },
   ) {
-    let sessionId = data?.sessionId || uuidv4();
+    const requestedSessionId = normalizeTextInput(data?.sessionId, {
+      maxLength: 64,
+      collapseWhitespace: false,
+    });
+    let sessionId = requestedSessionId || uuidv4();
     let conversation = await this.convRepo.findOne({ where: { sessionId } });
     const isNewConversation = !conversation;
 
@@ -1298,7 +1349,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('user_message')
   async handleUserMessageCompat(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { conversationId: string; content: string },
+    @MessageBody() data: ChatMessagePayload,
   ) {
     await this.handleMessage(client, data);
   }
@@ -1306,12 +1357,27 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('message')
   async handleMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { conversationId: string; content: string },
+    @MessageBody() data: ChatMessagePayload,
   ) {
     const start = Date.now();
-    const { conversationId, content } = data;
+    const conversationId = normalizeTextInput(data?.conversationId, {
+      maxLength: 64,
+      collapseWhitespace: false,
+    });
+    const content = this.sanitizeIncomingContent(data?.content);
+    const queryContext = this.sanitizeQueryContext(data?.queryContext);
     const sessionId = this.socketToSession.get(client.id) || 'unknown';
     try {
+
+    if (!isUuidLike(conversationId)) {
+      client.emit('error', { reason: 'Invalid conversation id.' });
+      return;
+    }
+
+    if (!content) {
+      client.emit('error', { reason: 'Message is empty.' });
+      return;
+    }
 
     // ── Safety filter: reject Ask Admin as user message ─────────────────
     // Ask Admin should only be sent via 'ask_admin' event, never as 'message'
@@ -1348,11 +1414,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
+    const userInput = content.trim();
+    const structuredContext = await this.queryUnderstandingService.understandQuery({
+      conversationId,
+      userInput,
+      widgetContext: queryContext,
+    });
+
     // Save user message
-    const userMsg = await this.saveMessage(conversationId, 'user', content);
+    const userMsg = await this.saveMessage(conversationId, 'user', content, undefined, undefined, {
+      queryContext,
+      structuredContext,
+    });
     // Echo the persisted user message back to the conversation so user UI updates immediately.
     this.server.to(`conv_${conversationId}`).emit('message', userMsg);
     this.server.to('admin_room').emit('new_message', { conversationId, message: userMsg });
+    this.server.to('admin_room').emit('admin_new_user_message', { conversationId, message: userMsg });
 
     const conversation = await this.convRepo.findOne({ where: { id: conversationId } });
     if (!conversation) return;
@@ -1383,7 +1460,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     // ── Handle option buttons ──────────────────────────────────────────
-    const userInput = content.trim();
     let category = 'navigation';
     let ragUsed = false;
     let ragScore: number | undefined;
@@ -1560,7 +1636,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       } else {
       // ── PRIORITY 3: Grounded Gemini (DB + RAG context) ─────────────────
       // Main free-text path: send query to Gemini with catalog + knowledge context.
-      const groundedGemini = await this.getGroundedGeminiResponse(userInput);
+      const groundedGemini = await this.getGroundedGeminiResponse(userInput, structuredContext);
       if (groundedGemini) {
         const outputGuard = this.guardrailService.checkOutput(groundedGemini.answer);
         const safeAnswer = outputGuard.action === 'redact' ? outputGuard.safeContent! : groundedGemini.answer;
@@ -1577,6 +1653,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
           this.server.to(`conv_${conversationId}`).emit('message', msg);
           this.server.to('admin_room').emit('new_message', { conversationId, message: msg });
         } else {
+          if (this.shouldUseNoPartMatchTemplate(userInput, structuredContext)) {
+            const msg = await this.saveMessage(
+              conversationId,
+              'bot',
+              this.buildNoPartMatchTemplate(userInput),
+              'options',
+              { options: ['Find a Part', 'Search by Part Number', 'Ask Admin'] },
+              { ragUsed: true, ragSource: 'FAQ/Knowledge Base' },
+            );
+            this.server.to(`conv_${conversationId}`).emit('message', msg);
+            category = 'no-part-match';
+            ragUsed = true;
+            return;
+          }
+
           const msg = await this.saveMessage(
             conversationId,
             'bot',
@@ -1621,7 +1712,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         } else {
           // ── PRIORITY 5: Brand match ──────────────────────────────────────
           const brands = await this.getDistinctBrands();
-          const matchedBrand = brands.find((b) => b.toLowerCase() === userInput.toLowerCase());
+          const matchedBrand = structuredContext.brand
+            ? brands.find((b) => b.toLowerCase() === structuredContext.brand!.toLowerCase())
+            : brands.find((b) => b.toLowerCase() === userInput.toLowerCase());
           if (matchedBrand) {
             const models = await this.getModelsForBrand(matchedBrand);
             const msg = await this.saveMessage(
@@ -1715,7 +1808,15 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { conversationId: string; content: string },
   ) {
-    const { conversationId, content } = data;
+    const conversationId = normalizeTextInput(data?.conversationId, {
+      maxLength: 64,
+      collapseWhitespace: false,
+    });
+    const content = this.sanitizeIncomingContent(data?.content);
+    if (!isUuidLike(conversationId) || !content) {
+      client.emit('error', { reason: 'Invalid admin message payload.' });
+      return;
+    }
     const msg = await this.saveMessage(conversationId, 'admin', content);
     this.server.to(`conv_${conversationId}`).emit('message', msg);
     this.server.to('admin_room').emit('new_message', { conversationId, message: msg });
@@ -1732,9 +1833,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { query: string },
   ) {
-    const results = await this.ragService.adminQuery(data.query || '');
+    const query = normalizeTextInput(data?.query, { maxLength: 500 });
+    if (!query) {
+      client.emit('admin_rag_result', { query: '', results: [] });
+      return;
+    }
+    const results = await this.ragService.adminQuery(query);
     client.emit('admin_rag_result', {
-      query: data.query,
+      query,
       results: results.map((r) => ({
         question: r.document.metadata.question || r.document.id,
         answer: r.answer,
@@ -1748,7 +1854,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { conversationId: string },
   ) {
-    const { conversationId } = data;
+    const conversationId = normalizeTextInput(data?.conversationId, {
+      maxLength: 64,
+      collapseWhitespace: false,
+    });
+    if (!isUuidLike(conversationId)) {
+      client.emit('error', { reason: 'Invalid conversation id.' });
+      return;
+    }
     await this.convRepo.update({ id: conversationId }, {
       isAdminChatMode: true,
       isAdminJoined: false,
@@ -1772,7 +1885,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { conversationId: string },
   ) {
-    const { conversationId } = data;
+    const conversationId = normalizeTextInput(data?.conversationId, {
+      maxLength: 64,
+      collapseWhitespace: false,
+    });
+    if (!isUuidLike(conversationId)) {
+      client.emit('error', { reason: 'Invalid conversation id.' });
+      return;
+    }
     await this.convRepo.update({ id: conversationId }, {
       isAdminChatMode: false,
       isAdminJoined: false,
@@ -1982,6 +2102,134 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         content: 'Yes, we ship to Germany and select EU countries. Typical international delivery is 5–14 business days depending on destination.',
         widgetType: 'options',
         options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(sweden|international|outside norway|eu shipping)\b/i.test(q) && /\b(delivery|shipping|ship|lead time)\b/i.test(q)) {
+      return {
+        content: 'We can ship to Sweden and selected EU destinations. Typical delivery window is 5–14 business days depending on destination and customs processing.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(invoice|resend.*invoice|send.*invoice|copy.*invoice)\b/i.test(q)) {
+      return {
+        content: 'Yes, we can resend your invoice. Please share your order number and registered email, or use the Contact Admin button for immediate support.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(payment method|payment methods|how can i pay|accept payment|card|vipps|klarna|cash on delivery|cod)\b/i.test(q)) {
+      return {
+        content: 'We accept major card payments, Vipps, and Klarna where available. Cash on delivery is generally not available. For business billing or invoice setup, please contact admin.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(track|tracking|shipment status|where is my order|tracking number.*not working)\b/i.test(q)) {
+      return {
+        content: 'You can track shipment online using your tracking link. If tracking is not updating or not working, share your order number and tracking ID and we will verify with the carrier.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(express shipping|priority shipping|faster delivery)\b/i.test(q)) {
+      return {
+        content: 'Express shipping may be available for selected parts and destinations. Share your part details and delivery location, and we will confirm options and cost.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(delayed|delay|late delivery|order delayed)\b/i.test(q)) {
+      return {
+        content: 'Sorry for the delay. Please share your order number and we will check dispatch and carrier status immediately.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(wrong quantity|quantity wrong|missing quantity|short quantity)\b/i.test(q)) {
+      return {
+        content: 'Sorry about that. Please share your order number and a photo of received items/labels. We will correct the quantity issue quickly.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(packaging.*damaged|package.*damaged|damaged packaging)\b/i.test(q)) {
+      return {
+        content: 'Sorry to hear that. Please share photos of the packaging and part condition with your order number so we can arrange the next step quickly.',
+        widgetType: 'options',
+        options: ['Damaged Part', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(warranty|claim warranty|arrived broken|broken part)\b/i.test(q)) {
+      return {
+        content: 'Most parts include warranty coverage for manufacturing defects. To file a claim, share your order number, part number, and clear photos. Our team will review and arrange replacement when eligible.',
+        widgetType: 'options',
+        options: ['Damaged Part', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(return|wrongly ordered|wrong order|return policy for electrical)\b/i.test(q) && /\b(part|item|order|electrical)\b/i.test(q)) {
+      return {
+        content: 'Returns are supported within policy conditions. For wrongly ordered parts, share your order number and part details. For electrical parts, return eligibility depends on condition and policy compliance.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(cancel my order|cancel order after payment|order cancellation)\b/i.test(q)) {
+      return {
+        content: 'Order cancellation is possible before dispatch. Please share your order number immediately so we can confirm cancellation status.',
+        widgetType: 'options',
+        options: ['Order Help', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(photo|image|picture)\b/i.test(q) && /\bidentify|part\b/i.test(q)) {
+      return {
+        content: 'Yes, we can assist with part identification from a photo. Please send clear photos and vehicle details (VIN/registration or make/model/year).',
+        widgetType: 'options',
+        options: ['Ask Admin', 'Find a Part'],
+      };
+    }
+
+    if (/\b(installation instructions|installation guide|how to install|technical specification|technical specs|specification)\b/i.test(q)) {
+      return {
+        content: 'We can provide available technical specifications and installation guidance for many parts. Share the exact part number and vehicle details, and we will send the correct information.',
+        widgetType: 'options',
+        options: ['Search by Part Number', 'Ask Admin'],
+      };
+    }
+
+    if (/\b(bulk pricing|workshop pricing|fleet pricing|volume discount|special order lead time)\b/i.test(q)) {
+      return {
+        content: 'Yes, we support workshop/fleet volume pricing and special-order sourcing. Share expected quantity, part numbers, and target timeline for a tailored quote.',
+        widgetType: 'options',
+        options: ['Ask Admin', 'Search by Part Number'],
+      };
+    }
+
+    if (/\b(order without (an )?account|guest checkout|without creating an account)\b/i.test(q)) {
+      return {
+        content: 'Yes, guest checkout is available for most orders. You can also create an account later for easier tracking and history.',
+        widgetType: 'options',
+        options: ['Order Help', 'Find a Part'],
+      };
+    }
+
+    if (/\b(vin|registration)\b/i.test(q) && /\b(check|compatib|fit|confirm|suggest)\b/i.test(q)) {
+      return {
+        content: 'Yes, we can verify compatibility using VIN or registration details. Share the VIN/registration and requested part, and we will confirm fitment before you order.',
+        widgetType: 'options',
+        options: ['Find a Part', 'Ask Admin'],
       };
     }
 
@@ -2314,6 +2562,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       'cv joint', 'axle', 'driveshaft', 'prop shaft',
       // Exhaust
       'exhaust', 'catalytic converter', 'muffler', 'silencer', 'dpf',
+      'intercooler', 'turbocharger', 'turbo', 'engine mount', 'timing chain kit',
+      'fuel pump', 'battery cooling', 'cooling component', 'performance brake kit',
+      'parking sensor', 'wheel hub', 'hub', 'windshield washer pump', 'washer pump',
+      'side mirror', 'rear axle', 'headlight assembly', 'clutch kit', 'cabin air filter',
       // Electrical & body
       'headlight', 'headlamp', 'tail light', 'bulb', 'fog light',
       'battery', 'sensor', 'lambda', 'o2 sensor', 'abs sensor', 'cam sensor', 'map sensor',
@@ -2463,15 +2715,18 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     return { brand, model };
   }
 
-  private async findPartsFromIntent(input: string): Promise<Part[]> {
+  private async findPartsFromIntent(input: string, structuredContext?: StructuredQueryContext): Promise<Part[]> {
     const q = input.toLowerCase();
     const vehicleIdMatch = input.match(/\b([A-Z]{2,6}\d{3,10})\b/i);
     let vehicleId = vehicleIdMatch?.[1];
     const supplyContext = this.extractSupplyContext(input);
-    const aiIntent = await this.geminiService.extractPartsIntent(input);
+    const aiIntent = this.shouldUseAiIntentExtraction(input)
+      ? await this.geminiService.extractPartsIntent(input)
+      : null;
     const mergedContext = {
-      brand: aiIntent?.brand || supplyContext.brand,
-      model: aiIntent?.model || supplyContext.model,
+      brand: structuredContext?.brand || aiIntent?.brand || supplyContext.brand,
+      model: structuredContext?.model || aiIntent?.model || supplyContext.model,
+      variant: structuredContext?.variant,
     };
     if (!vehicleId && aiIntent?.vehicleId) vehicleId = aiIntent.vehicleId;
     const keywords: string[] = [];
@@ -2541,6 +2796,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (aiIntent?.partTerms?.length) {
       keywords.push(...aiIntent.partTerms);
     }
+    if (structuredContext?.part) {
+      keywords.push(structuredContext.part);
+    }
+    if (structuredContext?.metadata?.alternateTerms?.length) {
+      keywords.push(...structuredContext.metadata.alternateTerms);
+    }
 
     const dedupedKeywords = Array.from(new Set(keywords.map((k) => k.toLowerCase()).filter(Boolean)));
 
@@ -2550,6 +2811,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       .andWhere(vehicleId ? 'LOWER(part.vehicleId) = LOWER(:vehicleId)' : '1=1', { vehicleId })
       .andWhere(mergedContext.brand ? 'LOWER(part.brand) = LOWER(:brand)' : '1=1', { brand: mergedContext.brand })
       .andWhere(mergedContext.model ? 'LOWER(part.model) LIKE LOWER(:model)' : '1=1', { model: `%${mergedContext.model || ''}%` })
+      .andWhere(mergedContext.variant ? 'LOWER(part.variant) LIKE LOWER(:variant)' : '1=1', { variant: `%${mergedContext.variant || ''}%` })
       .take(200)
       .getMany();
 
@@ -2559,7 +2821,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // return all parts for that vehicle (used for broad "do you have parts for X6?" queries).
     // But only if the query actually has a vehicle hint — never dump random parts.
     if (dedupedKeywords.length === 0) {
-      if (mergedContext.brand || mergedContext.model || vehicleId || aiIntent?.isPartsQuery) {
+      if (mergedContext.brand || mergedContext.model || mergedContext.variant || vehicleId || aiIntent?.isPartsQuery || structuredContext?.intent === 'find_part') {
         return candidates.slice(0, 8);
       }
       return [];
@@ -2590,14 +2852,114 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     return scored;
   }
 
+  private shouldUseAiIntentExtraction(input: string): boolean {
+    if (!this.geminiService.isEnabled()) return false;
+    if (this.extractPartCodeFromText(input)) return false;
+
+    const lower = input.toLowerCase();
+    const supplyContext = this.extractSupplyContext(input);
+    const hasVehicleHint = this.hasVehicleOrModelHint(input);
+    const hasPartHint = this.hasPartTopicHint(input);
+    const hasVehicleCode = /\b([A-Z]{2,6}\d{3,10})\b/i.test(input);
+    const hasOpsIntent = /\b(part|parts|fit|fits|compatible|compatibility|availability|available|stock|price|cost|oem|aftermarket)\b/i.test(lower);
+    const hasBrandContext = Boolean(supplyContext.brand || supplyContext.model);
+
+    return hasVehicleHint || hasPartHint || hasVehicleCode || hasOpsIntent || hasBrandContext;
+  }
+
+  private isLikelyAutomotiveQuery(input: string): boolean {
+    const lower = input.toLowerCase();
+    const supplyContext = this.extractSupplyContext(input);
+    if (this.extractPartCodeFromText(input)) return true;
+    if (this.hasVehicleOrModelHint(input) || this.hasPartTopicHint(input)) return true;
+    if (supplyContext.brand || supplyContext.model) return true;
+
+    return /\b(vehicle|vin|registration|car|auto|automotive|part|parts|oem|aftermarket|fitment|compatible|catalog|brake|engine|suspension|steering|radiator|alternator|warranty|delivery|shipping|order tracking)\b/i.test(lower);
+  }
+
+  private shouldFetchKnowledgeSnippets(input: string): boolean {
+    const lower = input.toLowerCase();
+    return /\b(delivery|shipping|return|refund|damaged|warranty|payment|tracking|cancel|policy|oem|aftermarket|not listed|special order|contact)\b/i.test(lower);
+  }
+
+  private shouldUseNoPartMatchTemplate(input: string, structuredContext?: StructuredQueryContext): boolean {
+    const looksVehicleOrPartQuery =
+      this.hasVehicleOrModelHint(input) ||
+      this.hasPartTopicHint(input) ||
+      Boolean(structuredContext?.brand || structuredContext?.model || structuredContext?.part);
+
+    if (!looksVehicleOrPartQuery) return false;
+
+    const partIntents = new Set([
+      'find_part',
+      'availability_check',
+      'compatibility_check',
+      'price_check',
+      'general_parts_query',
+    ]);
+
+    const intent = (structuredContext?.intent || '').toLowerCase();
+    if (intent && !partIntents.has(intent)) return false;
+
+    return true;
+  }
+
+  private buildNoPartMatchTemplate(input: string): string {
+    const compact = input
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/[?.!]+$/g, '');
+
+    const normalized = compact
+      .replace(/^\s*(what\s+is|what's|whats|do\s+you\s+have|can\s+you\s+find|find|show\s+me)\s+/i, '')
+      .replace(/\b(price|cost|how\s+much|rate)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const safeEcho = normalized || compact || 'that item';
+    return `We currently do not have a direct catalog match for ${safeEcho}.`;
+  }
+
+  private buildAugmentedInput(input: string, structuredContext?: StructuredQueryContext): string {
+    if (!structuredContext) return input;
+
+    const contextTerms = [
+      structuredContext.brand,
+      structuredContext.model,
+      structuredContext.variant,
+      structuredContext.year,
+      structuredContext.part,
+    ].filter(Boolean);
+
+    const deduped = Array.from(new Set(contextTerms.map((term) => term!.trim())));
+    if (deduped.length === 0) return input;
+
+    return `${input} | context: ${deduped.join(' ')}`.trim();
+  }
+
   private async getGroundedGeminiResponse(
     input: string,
+    structuredContext?: StructuredQueryContext,
   ): Promise<{ answer: string; parts: Part[]; usedKnowledge: boolean } | null> {
     if (!this.geminiService.isEnabled()) return null;
+    if (!this.isLikelyAutomotiveQuery(input)) return null;
+    if (
+      structuredContext &&
+      structuredContext.fallbacks.includes('low_overall_confidence') &&
+      !structuredContext.brand &&
+      !structuredContext.model &&
+      !structuredContext.part
+    ) {
+      return null;
+    }
 
+    const fetchKnowledge = this.shouldFetchKnowledgeSnippets(input);
+    const augmentedInput = this.buildAugmentedInput(input, structuredContext);
     const [parts, ragResults] = await Promise.all([
-      this.findPartsFromIntent(input),
-      this.ragService.query(input, 2, { prioritizeClientDocs: true }),
+      this.findPartsFromIntent(input, structuredContext),
+      fetchKnowledge
+        ? this.ragService.query(augmentedInput, 2, { prioritizeClientDocs: true })
+        : Promise.resolve([]),
     ]);
 
     const partContext = parts.slice(0, 6).map((p) => ({
@@ -2610,8 +2972,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       fitment: p.fitment,
     }));
 
-    const knowledgeSnippets = ragResults.slice(0, 2).map((r) => r.answer || r.document?.content || '').filter(Boolean);
-    const answer = await this.geminiService.generateGroundedReply(input, {
+    const knowledgeSnippets = ragResults
+      .filter((r) => r.score >= ChatGateway.MIN_RAG_SCORE_FOR_GEMINI_CONTEXT)
+      .slice(0, 2)
+      .map((r) => r.answer || r.document?.content || '')
+      .filter(Boolean);
+    const answer = await this.geminiService.generateGroundedReply(augmentedInput, {
       parts: partContext,
       knowledgeSnippets,
     });
