@@ -2274,7 +2274,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     const intentMatches = await this.findPartsFromIntent(input);
     const supplyContext = this.extractSupplyContext(input);
-    const asksPrice = /\b(price|cost|how much|pricing)\b/i.test(input);
+    const asksPrice = /\b(price|cost|how much|pricing|quote|quotation|estimate)\b/i.test(input);
     const asksAvailability = /\b(do you have|have you got|you got|got any|any\b|can you supply|do you supply|available|in stock|stock|supply|need|looking for|searching for|want|find me|get me|sell|carry|source|order)\b/i.test(input);
     const hasVehicleOrModelHint = this.hasVehicleOrModelHint(input);
     const hasPartTopicHint = this.hasPartTopicHint(input);
@@ -2519,6 +2519,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Generic alphanumeric model pattern (e.g. E300, XC90, Q7)
     if (/\b[a-z]{1,4}\d{1,4}\b/i.test(input)) return true;
     const modelKeywords = [
+      'grand vitara', 'vitara', 'brezza', 'baleno', 'swift', 'dzire', 'ertiga', 'ciaz', 'alto', 'wagonr',
       'e-tron', 'land cruiser', 'glk', 'q7', 'q5', 'q3', 'q2', 'a4', 'a6', 'a3', 'a5', 'a7', 'a8',
       'x6', 'x5', 'x4', 'x3', 'x2', 'x1', 'm3', 'm4', 'm5', 'm6', 'm8',
       '1 series', '2 series', '3 series', '4 series', '5 series', '6 series', '7 series', '8 series',
@@ -2579,6 +2580,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private extractSupplyContext(input: string): { brand?: string; model?: string } {
     const q = input.toLowerCase();
     const brandMap: Array<{ pattern: RegExp; brand: string }> = [
+      { pattern: /maruti(?:\s+suzuki)?|suzuki/i, brand: 'Maruti Suzuki' },
       { pattern: /mercedes(?:-benz)?/i, brand: 'Mercedes-Benz' },
       { pattern: /honda/i, brand: 'Honda' },
       { pattern: /bmw/i, brand: 'BMW' },
@@ -2613,6 +2615,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Model hints — map common model keywords to brand+model
     const modelHints: Array<{ keyword: string; model: string; defaultBrand?: string }> = [
+      { keyword: 'grand vitara', model: 'Grand Vitara', defaultBrand: 'Maruti Suzuki' },
+      { keyword: 'vitara', model: 'Vitara', defaultBrand: 'Maruti Suzuki' },
+      { keyword: 'brezza', model: 'Brezza', defaultBrand: 'Maruti Suzuki' },
+      { keyword: 'baleno', model: 'Baleno', defaultBrand: 'Maruti Suzuki' },
+      { keyword: 'swift', model: 'Swift', defaultBrand: 'Maruti Suzuki' },
+      { keyword: 'dzire', model: 'Dzire', defaultBrand: 'Maruti Suzuki' },
+      { keyword: 'ertiga', model: 'Ertiga', defaultBrand: 'Maruti Suzuki' },
+      { keyword: 'ciaz', model: 'Ciaz', defaultBrand: 'Maruti Suzuki' },
       { keyword: 'e-tron', model: 'e-tron', defaultBrand: 'Audi' },
       { keyword: 'q8', model: 'Q8', defaultBrand: 'Audi' },
       { keyword: 'q7', model: 'Q7', defaultBrand: 'Audi' },
