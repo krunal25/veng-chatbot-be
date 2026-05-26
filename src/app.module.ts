@@ -11,6 +11,7 @@ import { RagService } from "./services/rag.service";
 import { GuardrailService } from "./services/guardrail.service";
 import { QueryMonitorService } from "./services/monitor.service";
 import { GeminiService } from "./services/gemini.service";
+import { QueryUnderstandingService } from "./services/query-understanding.service";
 import "dotenv/config";
 
 @Module({
@@ -49,6 +50,7 @@ import "dotenv/config";
     GuardrailService,
     QueryMonitorService,
     GeminiService,
+    QueryUnderstandingService,
   ],
 })
 export class AppModule {}
