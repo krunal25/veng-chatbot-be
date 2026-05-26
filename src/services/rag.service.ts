@@ -647,6 +647,12 @@ export class RagService implements OnModuleInit {
    * "EL" matching OEM/aftermarket FAQ).
    */
   async blendedFaqAnswer(userInput: string): Promise<string | null> {
+    // Guard: automotive part/vehicle queries should be handled by catalog/NLP/Gemini paths,
+    // not by generic FAQ/admin-upload snippets.
+    if (this.looksLikeAutomotivePartsQuery(userInput)) {
+      return null;
+    }
+
     // Part-number guard: if the input is a short alphanumeric code containing
     // digits, treat it as a part number and bail out immediately.
     // Pattern: 4–40 chars, alphanumeric + spaces/hyphens, MUST contain a digit,
@@ -691,12 +697,7 @@ export class RagService implements OnModuleInit {
       const raw: string = doc.metadata.originalContent || doc.content;
       const preview = this.extractRelevantSnippet(raw, userInput, 420);
       const truncated = raw.length > preview.length ? '...' : '';
-      const ft = (doc.metadata.fileType || 'txt').toUpperCase();
-      const name = doc.metadata.fileName || doc.metadata.title || 'Knowledge Base';
-      return (
-        `📄 From: ${name} (${ft})\n\n` +
-        `${preview}${truncated}`
-      );
+      return `${preview}${truncated}`;
     }
     
     if (doc.metadata.type !== 'part') return '';
@@ -738,6 +739,15 @@ export class RagService implements OnModuleInit {
     const start = Math.max(0, bestIdx - Math.floor(maxLen * 0.25));
     const end = Math.min(text.length, start + maxLen);
     return text.substring(start, end).trim();
+  }
+
+  private looksLikeAutomotivePartsQuery(userInput: string): boolean {
+    const q = (userInput || '').toLowerCase();
+    if (!q) return false;
+
+    if (/\b([a-z]{1,4}\d{1,4}|[a-z]{2,6}\d{3,10})\b/i.test(userInput)) return true;
+
+    return /\b(part|parts|part number|oem|aftermarket|fitment|compatible|vin|registration|car|vehicle|brand|model|variant|price|cost|quote|availability|in stock|stock|supply|brake|clutch|engine|suspension|steering|radiator|alternator|starter|bearing|filter|caliper|disc|pad)\b/i.test(q);
   }
 
   async rebuildIndex() {
