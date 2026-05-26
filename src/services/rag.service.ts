@@ -294,8 +294,12 @@ export class RagService implements OnModuleInit {
         tfidfVector: new Map(),
       }));
 
+      // Runtime FAQs are always injected so existing DBs get latest support topics
+      // without requiring data migration or reseeding.
+      const runtimeFaqDocs = this.buildRuntimeFaqDocs();
+
       // ── Step 6: Build TF-IDF for all documents ────────────────────────────
-      this.documents = [...ragKnowledgeDocs, ...partDocs];
+      this.documents = [...ragKnowledgeDocs, ...runtimeFaqDocs, ...partDocs];
       this.buildTfIdf();
 
       // ── Step 7: Persist embeddings to DB (async, non-blocking) ────────────
@@ -308,7 +312,7 @@ export class RagService implements OnModuleInit {
       const uploadCount = knowledgeDocs.filter((kd) => kd.docType === 'admin-upload').length;
       console.log(
         `✅ RAG index built from DB: ${this.documents.length} docs ` +
-        `(${faqCount} FAQ, ${uploadCount} admin uploads, ${partDocs.length} parts)`,
+        `(${faqCount} FAQ + ${runtimeFaqDocs.length} runtime FAQ, ${uploadCount} admin uploads, ${partDocs.length} parts)`,
       );
     } catch (err) {
       console.warn('RAG index build failed:', this.getErrorMessage(err));
@@ -474,6 +478,87 @@ export class RagService implements OnModuleInit {
       const magnitude = Math.sqrt(norm) || 1;
       doc.tfidfVector!.forEach((v, term) => doc.tfidfVector!.set(term, v / magnitude));
     });
+  }
+
+  private buildRuntimeFaqDocs(): RagDocument[] {
+    const items: Array<{ id: string; content: string; answer: string; tags: string[]; question: string }> = [
+      {
+        id: 'runtime-faq-invoice',
+        question: 'Invoice & Billing Copy',
+        content: 'invoice resend invoice copy billing invoice not received send invoice again',
+        answer: '🧾 **Invoice Support:**\n• We can resend your invoice quickly\n• Share your order number and registered email\n• For urgent billing support, click **Ask Admin**',
+        tags: ['invoice', 'billing', 'order help'],
+      },
+      {
+        id: 'runtime-faq-express-shipping',
+        question: 'Express Shipping Availability',
+        content: 'express shipping priority delivery faster shipment urgent order',
+        answer: '⚡ **Express Shipping:**\n• Available for selected parts and destinations\n• Share part details + destination for confirmation\n• Extra shipping charges may apply',
+        tags: ['express', 'shipping', 'delivery'],
+      },
+      {
+        id: 'runtime-faq-tracking-issue',
+        question: 'Tracking Link Not Working',
+        content: 'tracking number not working tracking issue shipment link invalid no tracking update',
+        answer: '📦 **Tracking Issue:**\n• Share your order number and tracking ID\n• We will verify the carrier update status\n• New/updated tracking details can be provided by support',
+        tags: ['tracking', 'carrier', 'order status'],
+      },
+      {
+        id: 'runtime-faq-wrong-quantity',
+        question: 'Wrong Quantity Received',
+        content: 'wrong quantity missing quantity short shipment incorrect quantity in order',
+        answer: '📋 **Quantity Issue:**\n• Share order number and received item photos\n• We will verify packing records and correct the issue\n• Click **Ask Admin** for immediate handling',
+        tags: ['quantity', 'order issue', 'support'],
+      },
+      {
+        id: 'runtime-faq-photo-identification',
+        question: 'Part Identification by Photo',
+        content: 'identify part from photo image picture unknown part recognition',
+        answer: '📸 **Part Identification:**\n• We can help identify parts from clear photos\n• Please provide VIN/registration or make/model/year\n• Click **Ask Admin** to submit details for manual confirmation',
+        tags: ['photo', 'identification', 'fitment'],
+      },
+      {
+        id: 'runtime-faq-tech-specs',
+        question: 'Technical Specifications',
+        content: 'technical specification specs datasheet dimensions fitment details installation instructions',
+        answer: '📑 **Technical Information:**\n• Share exact part number for technical specifications\n• We can provide available fitment/installation details\n• For full support, use **Ask Admin**',
+        tags: ['technical', 'specification', 'installation'],
+      },
+      {
+        id: 'runtime-faq-cod',
+        question: 'Cash on Delivery',
+        content: 'cash on delivery cod pay cash delivery payment methods',
+        answer: '💳 **Payment Methods:**\n• Card, Vipps, and Klarna are supported where available\n• Cash on Delivery is generally not available\n• Contact support for business billing options',
+        tags: ['payment', 'cod', 'billing'],
+      },
+      {
+        id: 'runtime-faq-ev-parts',
+        question: 'EV Spare Parts',
+        content: 'electric vehicle parts ev spare parts battery cooling e-tron model y tesla',
+        answer: '🔋 **EV Parts Support:**\n• Yes, we support many EV spare-part categories\n• Share model/year and required part for exact match\n• For battery-cooling and specialist items, ask admin for availability confirmation',
+        tags: ['ev', 'electric vehicle', 'battery cooling'],
+      },
+      {
+        id: 'runtime-faq-bulk-pricing',
+        question: 'Bulk Pricing for Workshops',
+        content: 'bulk pricing workshop pricing fleet quote quantity discount',
+        answer: '🏢 **Workshop & Bulk Pricing:**\n• We provide volume pricing for workshops/fleet orders\n• Share quantity, part numbers, and delivery target\n• A tailored quote can be prepared by support',
+        tags: ['bulk', 'workshop', 'quote'],
+      },
+    ];
+
+    return items.map((item) => ({
+      id: item.id,
+      content: item.content,
+      metadata: {
+        type: 'faq',
+        question: item.question,
+        answer: item.answer,
+        tags: item.tags,
+        source: 'runtime-faq',
+      },
+      tfidfVector: new Map(),
+    }));
   }
 
   private cosineSimilarity(queryVec: Map<string, number>, docVec: Map<string, number>): number {
