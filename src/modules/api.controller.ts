@@ -8,6 +8,18 @@ import { Message } from '../entities/message.entity';
 import { RagService } from '../services/rag.service';
 import { GuardrailService } from '../services/guardrail.service';
 import { QueryMonitorService } from '../services/monitor.service';
+import {
+  isUuidLike,
+  normalizeTextInput,
+  parseClampedInt,
+  sanitizeFileName,
+} from '../utils/request-safety.util';
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  return 'Unknown error';
+}
 
 @Controller('api')
 export class ApiController {
@@ -22,11 +34,12 @@ export class ApiController {
 
   @Get('parts/search')
   async searchParts(@Query('q') q: string) {
-    if (!q) return [];
+    const safeQuery = normalizeTextInput(q, { maxLength: 120 });
+    if (!safeQuery) return [];
     return this.partRepo.createQueryBuilder('part')
-      .where('LOWER(part.partNumber) LIKE LOWER(:q)', { q: `%${q}%` })
-      .orWhere('LOWER(part.name) LIKE LOWER(:q)', { q: `%${q}%` })
-      .orWhere('LOWER(part.internalCode) LIKE LOWER(:q)', { q: `%${q}%` })
+      .where('LOWER(part.partNumber) LIKE LOWER(:q)', { q: `%${safeQuery}%` })
+      .orWhere('LOWER(part.name) LIKE LOWER(:q)', { q: `%${safeQuery}%` })
+      .orWhere('LOWER(part.internalCode) LIKE LOWER(:q)', { q: `%${safeQuery}%` })
       .take(20).getMany();
   }
 
@@ -41,26 +54,31 @@ export class ApiController {
     @Query('availability') availability: string,
     @Query('sortBy') sortBy: string,
   ) {
-    const pageNum = Math.max(1, parseInt(page) || 1);
-    const limitNum = Math.min(100, parseInt(limit) || 20);
+    const pageNum = parseClampedInt(page, 1, 1, 1000000);
+    const limitNum = parseClampedInt(limit, 20, 1, 100);
     const skip = (pageNum - 1) * limitNum;
+    const safeSearch = normalizeTextInput(search, { maxLength: 120 });
+    const safeCategory = normalizeTextInput(category, { maxLength: 60 });
+    const safeBrand = normalizeTextInput(brand, { maxLength: 60 });
+    const safeAvailability = normalizeTextInput(availability, { maxLength: 30 });
+    const safeSortBy = normalizeTextInput(sortBy, { maxLength: 30 });
 
     let qb = this.partRepo.createQueryBuilder('part');
 
-    if (search) {
-      const q = `%${search.toLowerCase()}%`;
+    if (safeSearch) {
+      const q = `%${safeSearch.toLowerCase()}%`;
       qb = qb.where(
         'LOWER(part.name) LIKE :q OR LOWER(part.partNumber) LIKE :q OR LOWER(part.brand) LIKE :q OR LOWER(part.internalCode) LIKE :q',
         { q },
       );
     }
-    if (category && category !== 'All') qb = qb.andWhere('part.category = :category', { category });
-    if (brand && brand !== 'All') qb = qb.andWhere('part.brand = :brand', { brand });
-    if (availability && availability !== 'All') qb = qb.andWhere('part.availability = :availability', { availability });
+    if (safeCategory && safeCategory !== 'All') qb = qb.andWhere('part.category = :category', { category: safeCategory });
+    if (safeBrand && safeBrand !== 'All') qb = qb.andWhere('part.brand = :brand', { brand: safeBrand });
+    if (safeAvailability && safeAvailability !== 'All') qb = qb.andWhere('part.availability = :availability', { availability: safeAvailability });
 
-    if (sortBy === 'price_asc') qb = qb.orderBy('part.price', 'ASC');
-    else if (sortBy === 'price_desc') qb = qb.orderBy('part.price', 'DESC');
-    else if (sortBy === 'brand') qb = qb.orderBy('part.brand', 'ASC');
+    if (safeSortBy === 'price_asc') qb = qb.orderBy('part.price', 'ASC');
+    else if (safeSortBy === 'price_desc') qb = qb.orderBy('part.price', 'DESC');
+    else if (safeSortBy === 'brand') qb = qb.orderBy('part.brand', 'ASC');
     else qb = qb.orderBy('part.name', 'ASC');
 
     const [parts, total] = await qb.skip(skip).take(limitNum).getManyAndCount();
@@ -150,15 +168,18 @@ export class ApiController {
 
   @Get('conversations/messages')
   async getMessages(@Query('conversationId') conversationId: string) {
-    return this.msgRepo.find({ where: { conversationId }, order: { createdAt: 'ASC' } });
+    const safeConversationId = normalizeTextInput(conversationId, { maxLength: 64, collapseWhitespace: false });
+    if (!isUuidLike(safeConversationId)) return [];
+    return this.msgRepo.find({ where: { conversationId: safeConversationId }, order: { createdAt: 'ASC' } });
   }
 
   // ── RAG Endpoints ───────────────────────────────────────────────────────
   @Get('rag/query')
   async ragQuery(@Query('q') q: string) {
-    if (!q) return { results: [] };
-    const results = await this.ragService.query(q, 3, { prioritizeClientDocs: true });
-    return { query: q, results };
+    const safeQuery = normalizeTextInput(q, { maxLength: 500 });
+    if (!safeQuery) return { results: [] };
+    const results = await this.ragService.query(safeQuery, 3, { prioritizeClientDocs: true });
+    return { query: safeQuery, results };
   }
 
   @Get('rag/stats')
@@ -181,7 +202,7 @@ export class ApiController {
     try {
       return await this.ragService.getAllDocuments();
     } catch (err) {
-      return { error: err.message, documents: [], stats: {} };
+      return { error: getErrorMessage(err), documents: [], stats: {} };
     }
   }
 
@@ -194,9 +215,10 @@ export class ApiController {
   // ── Guardrail Endpoints ─────────────────────────────────────────────────
   @Get('guardrail/test')
   testGuardrail(@Query('input') input: string) {
-    if (!input) return { error: 'Provide ?input=' };
-    const result = this.guardrailService.checkInput('test-session', input);
-    return { input, ...result };
+    const safeInput = normalizeTextInput(input, { maxLength: 500 });
+    if (!safeInput) return { error: 'Provide ?input=' };
+    const result = this.guardrailService.checkInput('test-session', safeInput);
+    return { input: safeInput, ...result };
   }
 
   @Get('guardrail/stats')
@@ -207,7 +229,7 @@ export class ApiController {
   // ── Monitor Endpoints ───────────────────────────────────────────────────
   @Get('monitor/stats')
   getMonitorStats(@Query('hours') hours: string) {
-    const h = parseInt(hours) || 24;
+    const h = parseClampedInt(hours, 24, 1, 24 * 30);
     return this.monitorService.getStats(h);
   }
 
@@ -264,8 +286,20 @@ export class ApiController {
     },
   ) {
     try {
-      if (!body.fileName || !body.content) {
+      if (!body || !body.fileName || !body.content) {
         return { error: 'Missing required fields: fileName, content' };
+      }
+
+      const safeFileName = sanitizeFileName(body.fileName);
+      if (!safeFileName) {
+        return { error: 'Invalid fileName' };
+      }
+
+      const safeConversationId = body.conversationId
+        ? normalizeTextInput(body.conversationId, { maxLength: 64, collapseWhitespace: false })
+        : undefined;
+      if (safeConversationId && !isUuidLike(safeConversationId)) {
+        return { error: 'conversationId must be a UUID' };
       }
 
       const validTypes = ['pdf', 'txt', 'md', 'json', 'csv'];
@@ -287,25 +321,26 @@ export class ApiController {
 
       await this.ragService.addClientDocument(
         docId,
-        body.fileName,
+        safeFileName,
         fileType,
         body.content,
-        body.conversationId,
+        safeConversationId,
         body.metadata || {},
       );
 
       return {
         success: true,
         documentId: docId,
-        fileName: body.fileName,
+        fileName: safeFileName,
         fileType,
         fileSizeKB: (fileSizeBytes / 1024).toFixed(2),
-        message: `✅ "${body.fileName}" uploaded and added to RAG knowledge base!`,
+        message: `✅ "${safeFileName}" uploaded and added to RAG knowledge base!`,
         indexStats: this.ragService.getIndexStats(),
       };
     } catch (err) {
-      console.error('Document upload failed:', err.message);
-      return { error: `Upload failed: ${err.message}` };
+      const errorMessage = getErrorMessage(err);
+      console.error('Document upload failed:', errorMessage);
+      return { error: `Upload failed: ${errorMessage}` };
     }
   }
 
@@ -314,14 +349,15 @@ export class ApiController {
    */
   @Get('rag/conversation-documents')
   async getConversationDocuments(@Query('conversationId') conversationId: string) {
-    if (!conversationId) {
+    const safeConversationId = normalizeTextInput(conversationId, { maxLength: 64, collapseWhitespace: false });
+    if (!isUuidLike(safeConversationId)) {
       return { error: 'conversationId query parameter required' };
     }
     try {
-      const documents = await this.ragService.getConversationDocuments(conversationId);
-      return { conversationId, documents, count: documents.length };
+      const documents = await this.ragService.getConversationDocuments(safeConversationId);
+      return { conversationId: safeConversationId, documents, count: documents.length };
     } catch (err) {
-      return { error: err.message };
+      return { error: getErrorMessage(err) };
     }
   }
 
@@ -333,15 +369,16 @@ export class ApiController {
     @Query('q') query: string,
     @Query('topK') topK: string,
   ) {
-    if (!query) {
+    const safeQuery = normalizeTextInput(query, { maxLength: 500 });
+    if (!safeQuery) {
       return { error: 'query parameter (q) is required' };
     }
     try {
-      const k = Math.min(10, parseInt(topK) || 3);
-      const results = await this.ragService.queryClientDocuments(query, k);
-      return { query, results, count: results.length };
+      const k = parseClampedInt(topK, 3, 1, 10);
+      const results = await this.ragService.queryClientDocuments(safeQuery, k);
+      return { query: safeQuery, results, count: results.length };
     } catch (err) {
-      return { error: err.message };
+      return { error: getErrorMessage(err) };
     }
   }
 
@@ -354,7 +391,7 @@ export class ApiController {
       const result = await this.ragService.rebuildIndexWithClientDocs();
       return { success: true, ...result };
     } catch (err) {
-      return { error: err.message };
+      return { error: getErrorMessage(err) };
     }
   }
 
@@ -367,21 +404,23 @@ export class ApiController {
     @Body() body: { documentId: string; conversationId?: string }
   ) {
     try {
-      if (!body.documentId) {
+      const safeDocumentId = normalizeTextInput(body?.documentId, { maxLength: 64, collapseWhitespace: false });
+      if (!isUuidLike(safeDocumentId)) {
         return { error: 'Missing required field: documentId' };
       }
 
-      await this.ragService.removeClientDocument(body.documentId);
+      await this.ragService.removeClientDocument(safeDocumentId);
 
       return {
         success: true,
-        documentId: body.documentId,
+        documentId: safeDocumentId,
         message: 'Document removed from RAG knowledge base',
         indexStats: this.ragService.getIndexStats(),
       };
     } catch (err) {
-      console.error('Document removal failed:', err.message);
-      return { error: `Removal failed: ${err.message}` };
+      const errorMessage = getErrorMessage(err);
+      console.error('Document removal failed:', errorMessage);
+      return { error: `Removal failed: ${errorMessage}` };
     }
   }
 
@@ -394,11 +433,13 @@ export class ApiController {
     @Query('conversationId') conversationId: string,
   ) {
     try {
-      if (!documentId || !conversationId) {
+      const safeDocumentId = normalizeTextInput(documentId, { maxLength: 64, collapseWhitespace: false });
+      const safeConversationId = normalizeTextInput(conversationId, { maxLength: 64, collapseWhitespace: false });
+      if (!isUuidLike(safeDocumentId) || !isUuidLike(safeConversationId)) {
         return { error: 'Missing required query parameters: documentId, conversationId' };
       }
 
-      const document = await this.ragService.getDocumentById(documentId, conversationId);
+      const document = await this.ragService.getDocumentById(safeDocumentId, safeConversationId);
       if (!document) {
         return { error: 'Document not found' };
       }
@@ -418,7 +459,7 @@ export class ApiController {
         },
       };
     } catch (err) {
-      return { error: err.message };
+      return { error: getErrorMessage(err) };
     }
   }
 }
